@@ -43,6 +43,19 @@ class LeadUpdate(BaseModel):
     enrollment_status: Optional[str] = None
 
 
+class LeadSuppressionRequest(BaseModel):
+    reason: Literal["unsubscribed", "complaint", "hard_bounce", "manual"]
+
+
+class LeadSuppressionResponse(BaseModel):
+    lead_id: int
+    status: str
+    enrollments_stopped: int
+    queue_slots_deleted: int
+    campaigns_paused: int = 0
+    inboxes_paused: int = 0
+
+
 class LeadRecoverRequest(BaseModel):
     """Fix a lead's email, set status to active, and re-enter the send flow.
 
@@ -424,6 +437,8 @@ class EmailLogResponse(BaseModel):
     sequence_index: int
     sent_at: datetime
     subject: str
+    delivery_state: str = "sent"
+    delivery_error: str = ""
 
     class Config:
         from_attributes = True

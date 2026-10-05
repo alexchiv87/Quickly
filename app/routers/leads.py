@@ -32,10 +32,13 @@ from app.schemas import (
     LeadCreate,
     LeadRecoverRequest,
     LeadResponse,
+    LeadSuppressionRequest,
+    LeadSuppressionResponse,
     LeadUpdate,
     LeadCampaignInfo,
     MarkReplied,
 )
+from app.suppression import suppress_lead_globally
 
 log = logging.getLogger("quickly.routes")
 
@@ -871,11 +874,21 @@ async def update_lead(
     enrollment_changed = False
     if data.enrollment_status is not None:
         target = normalize_enrollment_status(data.enrollment_status)
-        cl_res = await db.execute(select(CampaignLead).where(CampaignLead.lead_id == lead_id))
-        for cl in cl_res.scalars().all():
-            if cl.enrollment_status != target:
-                cl.enrollment_status = target
-                enrollment_changed = True
+        if target in ("unsubscribed", "bounced"):
+            suppression = await suppress_lead_globally(
+                db,
+                lead,
+                "unsubscribed" if target == "unsubscribed" else "hard_bounce",
+            )
+            enrollment_changed = suppression.enrollments_stopped > 0
+        else:
+            cl_res = await db.execute(
+                select(CampaignLead).where(CampaignLead.lead_id == lead_id)
+            )
+            for cl in cl_res.scalars().all():
+                if cl.enrollment_status != target:
+                    cl.enrollment_status = target
+                    enrollment_changed = True
     await db.flush()
 
     if enrollment_changed:
@@ -906,6 +919,29 @@ async def update_lead(
         replied,
         interactions=interactions,
         inbox_by_pair=inbox_by_pair,
+    )
+
+
+@router.post("/{lead_id}/suppress", response_model=LeadSuppressionResponse)
+async def suppress_lead(
+    lead_id: int,
+    data: LeadSuppressionRequest,
+    db: AsyncSession = Depends(get_db),
+) -> LeadSuppressionResponse:
+    """Stop a lead globally; a complaint pauses every campaign and inbox."""
+    result = await db.execute(select(Lead).where(Lead.id == lead_id))
+    lead = result.scalar_one_or_none()
+    if lead is None:
+        raise HTTPException(404, "Lead not found")
+    suppression = await suppress_lead_globally(db, lead, data.reason)
+    await db.commit()
+    return LeadSuppressionResponse(
+        lead_id=suppression.lead_id,
+        status=suppression.status,
+        enrollments_stopped=suppression.enrollments_stopped,
+        queue_slots_deleted=suppression.queue_slots_deleted,
+        campaigns_paused=suppression.campaigns_paused,
+        inboxes_paused=suppression.inboxes_paused,
     )
 
 

@@ -231,6 +231,7 @@ See [`.env.example`](.env.example) for the full annotated reference.
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | **Full installation guide** — Railway, VPS, nginx migration, local dev, Gmail / Office 365 / SMTP setup |
 | [docs/API.md](docs/API.md) | Complete REST API reference — 90+ endpoints |
+| [docs/DELIVERY_SAFETY.md](docs/DELIVERY_SAFETY.md) | Durable SMTP attempts, IMAP reconciliation, suppression, and safe ramp-up |
 | [docs/MCP.md](docs/MCP.md) | **MCP for AI clients** — endpoint, auth, tools, Cursor / `mcp-remote` config, troubleshooting |
 | [docs/WEBHOOKS.md](docs/WEBHOOKS.md) | All 15 webhook event types, payload schemas, and authentication |
 | [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md) | Contributing guidelines and local dev environment setup |

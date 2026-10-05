@@ -68,6 +68,17 @@ class SendFailure:
         return False
 
 
+@dataclass(frozen=True)
+class SendAmbiguous:
+    """SMTP may have accepted the message, so an automatic retry is unsafe."""
+
+    message_id: str
+    message: str
+
+    def __bool__(self) -> bool:
+        return False
+
+
 # ---- Gmail API file logger ----
 _LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 _LOG_DIR.mkdir(exist_ok=True)
@@ -668,13 +679,15 @@ def send_email(
     conversation_id: Optional[str] = None,
     reply_graph_message_id: Optional[str] = None,
     smtp_account: Optional[SmtpAccount] = None,
-) -> Optional[SendResult | SendFailure]:
+    smtp_message_id: Optional[str] = None,
+) -> Optional[SendResult | SendFailure | SendAmbiguous]:
     """Send one email via Gmail API or Microsoft Graph API.
 
     Returns:
         ``SendResult``  — success (truthy).
         ``SendFailure`` — permanent error, do NOT retry (falsy).
-        ``None``        — transient error, safe to retry later.
+        ``SendAmbiguous`` — SMTP outcome is unknown; hold for reconciliation.
+        ``None``          — transient error, safe to retry later.
 
     In test mode the send is simulated: no email is actually delivered but a
     fake ``SendResult`` is returned so that the rest of the pipeline (DB
@@ -718,6 +731,7 @@ def send_email(
             smtp_account=smtp_account,
             list_unsubscribe_url=list_unsubscribe_url,
             list_unsubscribe_one_click=list_unsubscribe_one_click,
+            message_id=smtp_message_id,
         )
 
     if provider == "office365":
@@ -1082,7 +1096,8 @@ def _send_via_smtp(
     smtp_account: SmtpAccount | None = None,
     list_unsubscribe_url: Optional[str] = None,
     list_unsubscribe_one_click: bool = True,
-) -> Optional[SendResult | SendFailure]:
+    message_id: Optional[str] = None,
+) -> Optional[SendResult | SendFailure | SendAmbiguous]:
     """Send one email via a generic SMTP relay (stdlib ``smtplib``).
 
     Threading works exactly like the Gmail path: follow-ups carry
@@ -1099,7 +1114,7 @@ def _send_via_smtp(
     import smtplib
     import socket
 
-    message_id = make_msgid()
+    message_id = message_id or make_msgid()
     mime_msg = _build_email_message(
         to_email=to_email,
         subject=subject,
@@ -1125,6 +1140,7 @@ def _send_via_smtp(
         thread_key = message_id
 
     _log_smtp_call(to_email, from_email, subject, thread_id=thread_key)
+    delivery_started = False
     try:
         from app.smtp_utils import _smtp_connect, smtp_timeout_seconds
 
@@ -1132,7 +1148,13 @@ def _send_via_smtp(
         # answers must not hold the worker (and its DB session) open forever.
         client = _smtp_connect(smtp_account, timeout=smtp_timeout_seconds())
         try:
-            client.sendmail(from_email, [to_email], raw_bytes)
+            delivery_started = True
+            envelope_recipients = [to_email]
+            if smtp_account.reconciliation_copy_enabled and from_email.lower() != to_email.lower():
+                envelope_recipients.append(from_email)
+            refused_recipients = client.sendmail(
+                from_email, envelope_recipients, raw_bytes
+            )
         finally:
             try:
                 client.quit()
@@ -1141,6 +1163,22 @@ def _send_via_smtp(
                     client.close()
                 except Exception:
                     pass
+        refused_addresses = {address.lower() for address in refused_recipients}
+        if to_email.lower() in refused_addresses:
+            refusal = next(
+                value
+                for address, value in refused_recipients.items()
+                if address.lower() == to_email.lower()
+            )
+            return SendFailure(
+                error_type="invalid_recipient",
+                message=f"SMTP recipient refused: {str(refusal)[:300]}",
+            )
+        if from_email.lower() in refused_addresses:
+            log.warning(
+                "SMTP reconciliation copy was refused for %s; recipient delivery was accepted",
+                from_email,
+            )
         _log_smtp_call(
             to_email, from_email, subject,
             thread_id=thread_key,
@@ -1195,11 +1233,21 @@ def _send_via_smtp(
         # Transient connection error (refused/timeout/TLS).  Previously this was
         # swallowed entirely — now it is persisted so the inbox UI can warn.
         _record_smtp_failure(smtp_account, f"SMTP connection error: {e}")
+        if delivery_started:
+            return SendAmbiguous(
+                message_id=message_id,
+                message=f"SMTP acknowledgement was not confirmed: {str(e)[:300]}",
+            )
         return None
     except Exception as e:
         _log_smtp_call(to_email, from_email, subject, thread_id=thread_key, status="ERROR", error=str(e)[:300])
         log.error("SMTP send error: %s", e)
         _record_smtp_failure(smtp_account, f"SMTP send error: {e}")
+        if delivery_started:
+            return SendAmbiguous(
+                message_id=message_id,
+                message=f"SMTP outcome is unknown: {str(e)[:300]}",
+            )
         return None
 
 

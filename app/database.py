@@ -210,6 +210,11 @@ async def _run_migrations(conn) -> None:
         "ALTER TABLE smtp_account ADD COLUMN IF NOT EXISTS last_diagnostic_json TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE smtp_account ADD COLUMN IF NOT EXISTS last_send_error TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE smtp_account ADD COLUMN IF NOT EXISTS last_send_at TIMESTAMP WITHOUT TIME ZONE NULL",
+        # 2026-10-05: durable SMTP delivery identity + ambiguous-send hold.
+        "ALTER TABLE email_log ADD COLUMN IF NOT EXISTS queue_slot_id INTEGER NULL",
+        "ALTER TABLE email_log ADD COLUMN IF NOT EXISTS delivery_state VARCHAR(32) NOT NULL DEFAULT 'sent'",
+        "ALTER TABLE email_log ADD COLUMN IF NOT EXISTS delivery_error TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE smtp_account ADD COLUMN IF NOT EXISTS reconciliation_copy_enabled BOOLEAN NOT NULL DEFAULT FALSE",
         # 2026-09-22: per-campaign RFC 8058 one-click unsubscribe toggle
         "ALTER TABLE campaign ADD COLUMN IF NOT EXISTS add_one_click_unsubscribe BOOLEAN NOT NULL DEFAULT TRUE",
     ]
@@ -241,6 +246,12 @@ async def _run_migrations(conn) -> None:
         await conn.execute(text(stmt))
     await conn.execute(
         text("CREATE UNIQUE INDEX IF NOT EXISTS ix_inbox_connect_token ON inbox (connect_token)")
+    )
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_email_log_queue_slot_id "
+            "ON email_log (queue_slot_id) WHERE queue_slot_id IS NOT NULL"
+        )
     )
     await conn.execute(
         text(
