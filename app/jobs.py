@@ -12,6 +12,7 @@ import secrets
 from datetime import datetime, date, time, timedelta
 from email.utils import make_msgid
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 try:
@@ -37,13 +38,16 @@ from app.models import (
     GmailMessage,
     Office365Message,
     CustomEmailOverride,
+    SmtpAccount,
 )
-from app.sender import send_email, render_body, get_lead_data, SendResult, SendFailure, build_quote_html, build_quote_plain, _plain_to_quoted_html, _strip_html_tags
+from app.sender import send_email, render_body, get_lead_data, SendResult, SendFailure, SendAmbiguous, build_quote_html, build_quote_plain, _plain_to_quoted_html, _strip_html_tags
 from app.webhooks import fire_webhook_event
 from app.app_settings import get_google_oauth_credentials, get_office365_oauth_credentials
 from app import time as time_provider
 from app.queue_logic import _parse_time, compute_effective_daily_limit
 from app.campaign_lead_status import campaign_lead_may_receive_sends
+from app.delivery_safety import deterministic_message_id, reconcile_smtp_copy
+from app.suppression import suppress_lead_globally
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +153,71 @@ async def _update_enrollment_after_send(session: AsyncSession, cl: CampaignLead,
         cl.enrollment_status = "contacted"
     if n_seq > 0 and sequence.position >= n_seq - 1:
         cl.enrollment_status = "completed"
+
+
+async def _reconcile_existing_smtp_attempt(
+    session: AsyncSession,
+    *,
+    slot: QueueSlot,
+    campaign_lead: CampaignLead,
+    campaign: Campaign,
+    lead: Lead,
+    sequence: Sequence,
+    inbox: Inbox,
+    email_log: EmailLog,
+) -> None:
+    """Resolve or hold an SMTP attempt that survived a worker restart."""
+    smtp_result = await session.execute(
+        select(SmtpAccount).where(SmtpAccount.inbox_id == inbox.id)
+    )
+    smtp_account = smtp_result.scalar_one_or_none()
+    if email_log.delivery_state == "sent":
+        await session.delete(slot)
+        await _update_enrollment_after_send(session, campaign_lead, campaign, sequence)
+        await session.commit()
+        return
+
+    if email_log.delivery_state == "sending":
+        email_log.delivery_state = "ambiguous"
+        email_log.delivery_error = "worker restarted before the SMTP result was committed"
+
+    inbox.paused = True
+    if smtp_account is None or not email_log.message_id:
+        await session.commit()
+        return
+
+    reconciliation = await asyncio.to_thread(
+        reconcile_smtp_copy, smtp_account, email_log.message_id
+    )
+    if reconciliation.outcome != "confirmed":
+        if reconciliation.detail:
+            email_log.delivery_error = reconciliation.detail
+        await session.commit()
+        return
+
+    email_log.delivery_state = "sent"
+    email_log.delivery_error = ""
+    await session.delete(slot)
+    await _update_enrollment_after_send(session, campaign_lead, campaign, sequence)
+    await fire_webhook_event(
+        session,
+        "email.sent",
+        {
+            "email_log_id": email_log.id,
+            "lead_id": lead.id,
+            "lead_email": lead.email,
+            "campaign_id": campaign.id,
+            "inbox_id": inbox.id,
+            "inbox_email": inbox.email,
+            "subject": email_log.subject,
+            "sequence_index": email_log.sequence_index,
+            "message_id": email_log.message_id,
+            "thread_id": email_log.thread_id,
+            "reconciled": True,
+            "timestamp": time_provider.utcnow().isoformat() + "Z",
+        },
+    )
+    await session.commit()
 
 # Updated each time run_send_job finishes (for /api/status)
 last_send_job_run: datetime | None = None
@@ -1156,6 +1225,27 @@ async def send_slot_job(slot_id: int) -> None:
 
         slot, cl, campaign, lead, sequence, inbox = row
 
+        # A durable SMTP attempt is claimed by queue_slot_id before any network
+        # call. A second worker or restarted worker must reconcile that attempt,
+        # never create another delivery for the same slot.
+        if inbox.provider == "smtp":
+            attempt_result = await session.execute(
+                select(EmailLog).where(EmailLog.queue_slot_id == slot.id)
+            )
+            existing_attempt = attempt_result.scalar_one_or_none()
+            if existing_attempt is not None:
+                await _reconcile_existing_smtp_attempt(
+                    session,
+                    slot=slot,
+                    campaign_lead=cl,
+                    campaign=campaign,
+                    lead=lead,
+                    sequence=sequence,
+                    inbox=inbox,
+                    email_log=existing_attempt,
+                )
+                return
+
         # ── Pre-flight checks ────────────────────────────────────────────
         if inbox.paused:
             log.info("send_slot_job: inbox %s paused, skipping slot %d", inbox.email, slot_id)
@@ -1559,7 +1649,16 @@ async def send_slot_job(slot_id: int) -> None:
         from_name = render_body(inbox.display_name or "", lead_data)
 
         # ── Pre-create EmailLog to get an ID for tracking ─────────────────
+        smtp_message_id = None
+        if inbox.provider == "smtp":
+            smtp_message_id = deterministic_message_id(
+                queue_slot_id=slot.id,
+                inbox_id=inbox.id,
+                campaign_id=campaign.id,
+                from_email=inbox.email,
+            )
         email_log_entry = EmailLog(
+            queue_slot_id=slot.id if inbox.provider == "smtp" else None,
             lead_id=lead.id,
             campaign_id=campaign.id,
             inbox_id=inbox.id,
@@ -1567,11 +1666,20 @@ async def send_slot_job(slot_id: int) -> None:
             variant_id=chosen_variant_id,
             subject=subject,
             format_override=format_override,
-            message_id="",
-            thread_id=prev_thread_id,
+            message_id=smtp_message_id or "",
+            thread_id=prev_thread_id or smtp_message_id,
+            delivery_state="sending" if inbox.provider == "smtp" else "sent",
         )
         session.add(email_log_entry)
-        await session.flush()
+        try:
+            await session.flush()
+        except IntegrityError:
+            await session.rollback()
+            log.info(
+                "send_slot_job: slot %d already has a durable SMTP attempt; skipping duplicate worker",
+                slot_id,
+            )
+            return
 
         # ── Inject open/click tracking ────────────────────────────────────
         send_body = body
@@ -1674,20 +1782,39 @@ async def send_slot_job(slot_id: int) -> None:
                     conversation_id=prev_thread_id if inbox.provider == "office365" else None,
                     reply_graph_message_id=reply_graph_message_id if inbox.provider == "office365" else None,
                     smtp_account=smtp_account,
+                    smtp_message_id=smtp_message_id,
                 )
             except Exception:
-                # Unexpected error from send_email: the pre-created EmailLog row
-                # was committed before the network call.  Drop it so it does not
-                # consume daily quota / count as a sent campaign step, then let
-                # _dispatch_slot's handler log it (the slot stays queued).
+                # SMTP may have crossed the DATA acceptance boundary, so retain
+                # its attempt for reconciliation. API transports keep their
+                # existing transient retry behaviour.
                 log.exception(
-                    "send_slot_job: send_email raised for slot %d (lead_id=%s); "
-                    "rolling back pre-created email log",
+                    "send_slot_job: send_email raised for slot %d (lead_id=%s)",
                     slot_id, lead.id,
                 )
-                await session.delete(email_log_entry)
-                await session.commit()
+                if inbox.provider == "smtp":
+                    email_log_entry.delivery_state = "ambiguous"
+                    email_log_entry.delivery_error = "sender raised after the SMTP attempt began"
+                    inbox.paused = True
+                    await session.commit()
+                else:
+                    await session.delete(email_log_entry)
+                    await session.commit()
                 raise
+
+        # ── Ambiguous SMTP outcome ──────────────────────────────────────────
+        if isinstance(result, SendAmbiguous):
+            email_log_entry.delivery_state = "ambiguous"
+            email_log_entry.delivery_error = result.message
+            email_log_entry.message_id = result.message_id
+            inbox.paused = True
+            await session.commit()
+            log.error(
+                "send_slot_job: SMTP outcome ambiguous for slot %d; inbox %s paused pending IMAP reconciliation",
+                slot_id,
+                inbox.email,
+            )
+            return
 
         # ── Permanent failure ─────────────────────────────────────────────
         if isinstance(result, SendFailure):
@@ -1698,11 +1825,7 @@ async def send_slot_job(slot_id: int) -> None:
             await session.delete(email_log_entry)
             if result.error_type in ("bounce", "invalid_recipient"):
                 prev_enr = getattr(cl, "enrollment_status", None) or "active"
-                cl.enrollment_status = "bounced"
-                from sqlalchemy import delete as _sql_delete
-                await session.execute(
-                    _sql_delete(QueueSlot).where(QueueSlot.campaign_lead_id == cl.id)
-                )
+                await suppress_lead_globally(session, lead, "hard_bounce")
                 await fire_webhook_event(session, "email.bounced", {
                     "lead_id": lead.id, "lead_email": lead.email,
                     "campaign_id": campaign.id, "inbox_id": inbox.id,
@@ -1744,6 +1867,8 @@ async def send_slot_job(slot_id: int) -> None:
         # ── Success ───────────────────────────────────────────────────────
         email_log_entry.message_id = result.message_id
         email_log_entry.thread_id = result.thread_id or prev_thread_id
+        email_log_entry.delivery_state = "sent"
+        email_log_entry.delivery_error = ""
         await session.delete(slot)
         await _update_enrollment_after_send(session, cl, campaign, sequence)
 

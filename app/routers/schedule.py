@@ -98,6 +98,8 @@ def _serialize_sent(
         "sent_date": el.sent_at.date().isoformat() if el.sent_at else None,
         "subject": el.subject or "",
         "message_id": el.message_id or "",
+        "delivery_state": el.delivery_state or "sent",
+        "delivery_error": el.delivery_error or "",
         "sequence_index": el.sequence_index,
         "sequence_id": seq.id if seq else None,
         "sequence_body": body,

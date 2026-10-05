@@ -139,7 +139,10 @@ class Lead(Base):
     email = Column(String(255), nullable=False, index=True)
     name = Column(String(255), default="")
     custom_data = Column(JSON, default=dict)  # e.g. {"company": "...", "title": "..."}
-    status = Column(String(32), default="active")  # active, unsubscribed, bounced, replied, invalid
+    # Global send eligibility: active, unsubscribed, bounced, invalid,
+    # complaint, or suppressed. Campaign-specific pipeline state lives on
+    # CampaignLead.enrollment_status.
+    status = Column(String(32), default="active")
     # Email verification: pending, valid, invalid, catch_all, unknown, risky, or null (not verified)
     email_verification_status = Column(String(32), nullable=True, default=None, index=True)
     # Raw JSON result from the verification provider
@@ -357,6 +360,11 @@ class EmailLog(Base):
         Index("ix_email_log_campaign", "campaign_id"),
     )
     id = Column(Integer, primary_key=True, index=True)
+    # A queue slot may create at most one durable delivery attempt. The slot
+    # itself is deleted after success, so this intentionally is not a foreign
+    # key; retaining the id lets a restarted worker recognise an in-flight or
+    # ambiguous SMTP delivery without sending it again.
+    queue_slot_id = Column(Integer, nullable=True, unique=True, index=True)
     lead_id = Column(Integer, ForeignKey("lead.id"), nullable=False)
     campaign_id = Column(Integer, ForeignKey("campaign.id"), nullable=False)
     inbox_id = Column(Integer, ForeignKey("inbox.id"), nullable=True)  # Track which inbox sent this email
@@ -375,6 +383,11 @@ class EmailLog(Base):
     subject = Column(String(512), default="")
     message_id = Column(String(512), default=None)  # RFC 822 Message-ID for In-Reply-To threading
     thread_id = Column(String(512), default=None)   # Gmail threadId for thread continuity
+    # sending -> sent | ambiguous. Historical rows default to sent. An
+    # ambiguous attempt stays visible and consumes quota until reconciled,
+    # which is safer for sender reputation than an automatic duplicate retry.
+    delivery_state = Column(String(32), nullable=False, default="sent")
+    delivery_error = Column(Text, nullable=False, default="")
     opened = Column(Boolean, default=False, nullable=False)
     clicked = Column(Boolean, default=False, nullable=False)
     lead = relationship("Lead", back_populates="email_logs")
@@ -752,6 +765,9 @@ class SmtpAccount(Base):
     imap_username = Column(String(255), nullable=False, default="")
     imap_password = Column(EncryptedText, nullable=False, default="")
     imap_use_ssl = Column(Boolean, default=True, nullable=False)
+    # Deliver an envelope-only copy to the sending mailbox so an ambiguous
+    # SMTP acknowledgement can be reconciled read-only by Message-ID in IMAP.
+    reconciliation_copy_enabled = Column(Boolean, default=False, nullable=False)
     # Last connection-test result (surfaced in system health + inbox UI)
     last_tested_at = Column(DateTime, nullable=True)
     last_test_ok = Column(Boolean, default=False, nullable=False)

@@ -11,6 +11,7 @@ from datetime import datetime
 
 import pytest
 from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
     EmailLog, EmailOpen, EmailClick,
@@ -382,6 +383,35 @@ async def test_unsubscribe_marks_enrollment_unsubscribed(session, monkeypatch):
 
     await session.refresh(cl)
     assert cl.enrollment_status == "unsubscribed"
+    await session.refresh(lead)
+    assert lead.status == "unsubscribed"
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_stops_every_campaign_for_the_lead(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.tracking_events.fire_webhook_event", _noop_webhook)
+    lead, _, first_cl, token_str = await _setup_unsubscribe(session)
+    second_campaign = await make_campaign(session, name="Second")
+    second_cl = await make_campaign_lead(session, second_campaign.id, lead.id)
+    second_inbox = await make_inbox(session, email="second@test.com")
+    await make_campaign_inbox(session, second_campaign.id, second_inbox.id)
+    await make_queue_slot(session, second_cl.id, second_inbox.id)
+
+    await unsubscribe(token=token_str, db=session)
+
+    await session.refresh(first_cl)
+    await session.refresh(second_cl)
+    assert first_cl.enrollment_status == "unsubscribed"
+    assert second_cl.enrollment_status == "unsubscribed"
+    remaining = await session.execute(
+        select(func.count(QueueSlot.id)).where(
+            QueueSlot.campaign_lead_id.in_([first_cl.id, second_cl.id])
+        )
+    )
+    assert remaining.scalar_one() == 0
 
 
 @pytest.mark.asyncio

@@ -1159,7 +1159,18 @@ async def patch_campaign_lead(
                 400,
                 f"status must be one of: {', '.join(sorted(ENROLLMENT_STATUSES))}",
             )
-        cl.enrollment_status = st
+        if st in ("unsubscribed", "bounced"):
+            lead_result = await db.execute(select(Lead).where(Lead.id == lead_id))
+            lead = lead_result.scalar_one()
+            from app.suppression import suppress_lead_globally
+
+            await suppress_lead_globally(
+                db,
+                lead,
+                "unsubscribed" if st == "unsubscribed" else "hard_bounce",
+            )
+        else:
+            cl.enrollment_status = st
 
     if payload.interest is not None:
         raw = payload.interest
@@ -1910,6 +1921,8 @@ async def list_sent_emails(campaign_id: int, db: AsyncSession = Depends(get_db))
             "sent_at": (el.sent_at.isoformat() + "Z") if el.sent_at else None,
             "sequence_index": el.sequence_index,
             "subject": el.subject or "",
+            "delivery_state": el.delivery_state or "sent",
+            "delivery_error": el.delivery_error or "",
             "lead_id": el.lead_id,
             "lead_email": lead.email,
             "lead_name": lead.name or "",

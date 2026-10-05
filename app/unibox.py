@@ -33,6 +33,7 @@ from app.models import (
 from app.routers.gmail_oauth import refresh_access_token
 from app.routers.office365_oauth import refresh_access_token as refresh_office365_token
 from app.campaign_lead_status import ENROLLMENT_STATUSES, LEAD_INTERESTS
+from app.suppression import suppress_lead_globally
 
 log = logging.getLogger("quickly.unibox")
 
@@ -762,6 +763,14 @@ async def _classify_and_notify_bg(
             if classification is None:
                 return  # classifier failed — normal webhook already sent
 
+            if classification == "unsubscribed":
+                lead_result = await session.execute(
+                    select(Lead).where(Lead.id == lead_id)
+                )
+                lead = lead_result.scalar_one_or_none()
+                if lead is not None:
+                    await suppress_lead_globally(session, lead, "unsubscribed")
+
             from app.models import CampaignLead as _CL
 
             for camp_id in campaign_ids:
@@ -1096,15 +1105,7 @@ async def _upsert_message_from_gmail(
                                 "NDR bounce detected for lead_id=%s email=%s (inbox_id=%s)",
                                 b_lead.id, bounced_addr, inbox_id,
                             )
-                            for _bcl in b_rows:
-                                _bcl.enrollment_status = "bounced"
-                            b_cl_ids = [r.id for r in b_rows]
-                            if b_cl_ids:
-                                await db.execute(
-                                    delete(QueueSlot).where(
-                                        QueueSlot.campaign_lead_id.in_(b_cl_ids)
-                                    )
-                                )
+                            await suppress_lead_globally(db, b_lead, "hard_bounce")
                             await db.flush()
                             b_camp_ids = list({r.campaign_id for r in b_rows})
                             for b_camp_id in b_camp_ids:
@@ -1679,11 +1680,7 @@ async def _process_smtp_inbound_message(
                             "SMTP NDR bounce detected for lead_id=%s email=%s (inbox_id=%s)",
                             b_lead.id, bounced_addr, inbox.id,
                         )
-                        for _bcl in b_rows:
-                            _bcl.enrollment_status = "bounced"
-                        b_cl_ids = [r.id for r in b_rows]
-                        if b_cl_ids:
-                            await db.execute(delete(QueueSlot).where(QueueSlot.campaign_lead_id.in_(b_cl_ids)))
+                        await suppress_lead_globally(db, b_lead, "hard_bounce")
                         await db.flush()
                         for b_camp_id in list({r.campaign_id for r in b_rows}):
                             try:
@@ -3988,13 +3985,7 @@ async def _detect_o365_lead_replies(
             "O365 NDR bounce detected for lead_id=%s email=%s (inbox_id=%s)",
             b_lead.id, bounced_addr, inbox.id,
         )
-        for _bcl in b_rows_o365:
-            _bcl.enrollment_status = "bounced"
-        b_cl_ids = [r.id for r in b_rows_o365]
-        if b_cl_ids:
-            await db.execute(
-                delete(QueueSlot).where(QueueSlot.campaign_lead_id.in_(b_cl_ids))
-            )
+        await suppress_lead_globally(db, b_lead, "hard_bounce")
         await db.flush()
 
         b_camp_res = await db.execute(
@@ -4086,4 +4077,3 @@ def decode_push_message_data(raw_data: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
-

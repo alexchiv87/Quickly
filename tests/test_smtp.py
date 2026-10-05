@@ -184,6 +184,10 @@ class _FakeSMTP:
             raise smtplib.SMTPRecipientsRefused({to_addrs[0]: (550, b"mailbox unavailable")})
         if self.behaviour == "auth":
             raise smtplib.SMTPAuthenticationError(535, b"bad credentials")
+        if self.behaviour == "disconnect":
+            raise smtplib.SMTPServerDisconnected("connection lost after DATA")
+        if self.behaviour == "partial_refusal":
+            return {to_addrs[0]: (550, b"mailbox unavailable")}
         return {}
 
     def quit(self):
@@ -223,6 +227,59 @@ def test_send_via_smtp_ok(monkeypatch):
     # New thread: thread key equals our own Message-ID.
     assert res.thread_id == res.message_id
     assert fake.sent and fake.sent[0][1] == ["lead@example.com"]
+
+
+def test_send_via_smtp_uses_stable_id_and_reconciliation_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeSMTP("ok")
+    monkeypatch.setattr("app.smtp_utils._smtp_connect", lambda account, timeout=30: fake)
+    message_id = "<quickly-stable@mydomain.com>"
+    res = sender_mod._send_via_smtp(
+        to_email="lead@example.com",
+        subject="Hi",
+        body="Hello",
+        from_email="me@mydomain.com",
+        smtp_account=_smtp_account(reconciliation_copy_enabled=True),
+        message_id=message_id,
+    )
+    assert isinstance(res, sender_mod.SendResult)
+    assert res.message_id == message_id
+    assert fake.sent[0][1] == ["lead@example.com", "me@mydomain.com"]
+
+
+def test_send_via_smtp_disconnect_after_data_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeSMTP("disconnect")
+    monkeypatch.setattr("app.smtp_utils._smtp_connect", lambda account, timeout=30: fake)
+    message_id = "<quickly-stable@mydomain.com>"
+    res = sender_mod._send_via_smtp(
+        to_email="lead@example.com",
+        subject="Hi",
+        body="Hello",
+        from_email="me@mydomain.com",
+        smtp_account=_smtp_account(),
+        message_id=message_id,
+    )
+    assert isinstance(res, sender_mod.SendAmbiguous)
+    assert res.message_id == message_id
+
+
+def test_reconciliation_copy_cannot_mask_recipient_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeSMTP("partial_refusal")
+    monkeypatch.setattr("app.smtp_utils._smtp_connect", lambda account, timeout=30: fake)
+    res = sender_mod._send_via_smtp(
+        to_email="bad@example.com",
+        subject="Hi",
+        body="Hello",
+        from_email="me@mydomain.com",
+        smtp_account=_smtp_account(reconciliation_copy_enabled=True),
+    )
+    assert isinstance(res, sender_mod.SendFailure)
+    assert res.error_type == "invalid_recipient"
 
 
 def test_send_via_smtp_thread_key_from_references(monkeypatch):
@@ -407,13 +464,20 @@ async def test_smtp_crud_and_test(session, monkeypatch):
     await session.flush()
 
     saved = await smtp_router.upsert_smtp_account(
-        inbox.id, smtp_router.SmtpAccountUpsert(**_valid_payload()), db=session, _user=object()
+        inbox.id,
+        smtp_router.SmtpAccountUpsert(
+            **_valid_payload(reconciliation_copy_enabled=True)
+        ),
+        db=session,
+        _user=object(),
     )
     assert saved["smtp_host"] == "mail.example.com"
     assert saved["has_smtp_password"] is True
+    assert saved["reconciliation_copy_enabled"] is True
 
     fetched = await smtp_router.get_smtp_account(inbox.id, db=session, _user=object())
     assert fetched["inbox_id"] == inbox.id
+    assert fetched["reconciliation_copy_enabled"] is True
 
     # Update without password keeps the stored secret.
     saved2 = await smtp_router.upsert_smtp_account(
