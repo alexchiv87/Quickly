@@ -56,6 +56,7 @@ class SmtpAccountUpsert(BaseModel):
     imap_username: str = Field(default="", max_length=255)
     imap_password: str = Field(default="", max_length=1024)
     imap_use_ssl: bool = True
+    reconciliation_copy_enabled: bool = False
 
 
 class SmtpAccountResponse(BaseModel):
@@ -70,6 +71,7 @@ class SmtpAccountResponse(BaseModel):
     imap_port: int
     imap_username: str
     imap_use_ssl: bool
+    reconciliation_copy_enabled: bool = False
     has_smtp_password: bool = False
     has_imap_password: bool = False
     last_tested_at: str | None = None
@@ -97,6 +99,7 @@ def _to_response(acct: SmtpAccount) -> dict:
         "imap_port": acct.imap_port or 993,
         "imap_username": acct.imap_username or "",
         "imap_use_ssl": bool(acct.imap_use_ssl),
+        "reconciliation_copy_enabled": bool(acct.reconciliation_copy_enabled),
         "has_smtp_password": bool(acct.smtp_password),
         "has_imap_password": bool(acct.imap_password),
         "last_tested_at": acct.last_tested_at.isoformat() if acct.last_tested_at else None,
@@ -223,6 +226,7 @@ async def upsert_smtp_account(
     elif not acct.imap_host:
         acct.imap_password = ""
     acct.imap_use_ssl = bool(payload.get("imap_use_ssl", True))
+    acct.reconciliation_copy_enabled = bool(payload.get("reconciliation_copy_enabled", False))
     acct.updated_at = utcnow()
     await db.flush()
     log.info("SMTP account saved: inbox_id=%s host=%s", inbox_id, acct.smtp_host)

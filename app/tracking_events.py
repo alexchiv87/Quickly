@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import time as time_provider
@@ -24,10 +24,10 @@ from app.models import (
     KnownIP,
     Lead,
     LeadUnsubscribeToken,
-    QueueSlot,
     TrackedLink,
 )
 from app.webhooks import fire_webhook_event
+from app.suppression import suppress_lead_globally
 
 if TYPE_CHECKING:
     pass
@@ -194,21 +194,16 @@ async def process_unsubscribe(db: AsyncSession, token: str) -> tuple[str, int]:
         )
     )
     cl = cl_res.scalar_one_or_none()
-    if not cl:
-        already_done = True
-    else:
-        if cl.enrollment_status == "unsubscribed":
-            already_done = True
-        else:
-            cl.enrollment_status = "unsubscribed"
-            cl.interest_status = None
-            log.info(
-                "Unsubscribed lead_id=%s via campaign_id=%s token=%s",
-                row.lead_id,
-                row.campaign_id,
-                token,
-            )
-        await db.execute(delete(QueueSlot).where(QueueSlot.campaign_lead_id == cl.id))
+    already_done = cl is None or cl.enrollment_status == "unsubscribed"
+    if lead is not None:
+        await suppress_lead_globally(db, lead, "unsubscribed")
+    if not already_done:
+        log.info(
+            "Globally unsubscribed lead_id=%s via campaign_id=%s token=%s",
+            row.lead_id,
+            row.campaign_id,
+            token,
+        )
 
     await db.commit()
 

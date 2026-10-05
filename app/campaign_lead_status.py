@@ -18,6 +18,9 @@ ENROLLMENT_STATUSES = frozenset(
 LEAD_INTERESTS = frozenset({"interested", "not_interested", "out_of_office", "auto_reply"})
 
 VERIFICATION_BLOCKS_SEND = frozenset({"invalid", "risky", "pending"})
+GLOBAL_STATUSES_BLOCK_SEND = frozenset(
+    {"unsubscribed", "bounced", "invalid", "complaint", "suppressed"}
+)
 
 
 def enrollment_blocks_sends(status: str | None) -> bool:
@@ -32,6 +35,8 @@ def interest_blocks_sends(interest: str | None) -> bool:
 
 def campaign_lead_may_receive_sends(cl: "CampaignLead", lead: "Lead") -> bool:
     """True if this enrollment should be considered for outbound scheduling."""
+    if getattr(lead, "status", "active") in GLOBAL_STATUSES_BLOCK_SEND:
+        return False
     ev = getattr(lead, "email_verification_status", None)
     if ev in VERIFICATION_BLOCKS_SEND:
         return False
@@ -72,6 +77,10 @@ def campaign_lead_schedule_eligibility_clause():
         or_(
             Lead.email_verification_status.is_(None),
             Lead.email_verification_status.notin_(_ver),
+        ),
+        or_(
+            Lead.status.is_(None),
+            Lead.status.notin_(tuple(GLOBAL_STATUSES_BLOCK_SEND)),
         ),
         or_(Campaign.stop_on_reply.is_(False), ~has_reply),
     )

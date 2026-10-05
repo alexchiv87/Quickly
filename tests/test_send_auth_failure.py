@@ -12,10 +12,12 @@ from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.jobs as jobs_mod
-from app.models import EmailLog, QueueSlot, SmtpAccount
-from app.sender import SendFailure, SendResult
+from app.models import CampaignLead, EmailLog, QueueSlot, SmtpAccount
+from app.delivery_safety import ReconciliationResult
+from app.sender import SendAmbiguous, SendFailure, SendResult
 from tests.conftest import (
     make_campaign,
     make_campaign_inbox,
@@ -178,14 +180,8 @@ async def test_sender_display_name_renders_lead_variables(session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_send_email_raising_removes_precreated_email_log(session, monkeypatch):
-    """An unexpected exception from send_email must not leave an orphan EmailLog.
-
-    The row is committed *before* the network call (so tracking tokens exist),
-    so without cleanup a crash would consume the inbox's daily quota, inflate
-    campaign ``emails_sent`` and make queue recalculation think the step had
-    already been sent.
-    """
+async def test_smtp_sender_exception_holds_durable_attempt(session, monkeypatch):
+    """An unexpected SMTP exception is unsafe to retry without reconciliation."""
     inbox = await _make_smtp_inbox(session, email="boom@example.com")
     slot = await _make_due_slot(session, inbox)
 
@@ -211,9 +207,12 @@ async def test_send_email_raising_removes_precreated_email_log(session, monkeypa
         await jobs_mod.send_slot_job(slot.id)
 
     remaining = (
-        await session.execute(select(func.count(EmailLog.id)).where(EmailLog.inbox_id == inbox.id))
-    ).scalar()
-    assert remaining == 0, "pre-created EmailLog row must be rolled back"
+        await session.execute(select(EmailLog).where(EmailLog.inbox_id == inbox.id))
+    ).scalar_one()
+    assert remaining.delivery_state == "ambiguous"
+    assert remaining.queue_slot_id == slot.id
+    await session.refresh(inbox)
+    assert inbox.paused is True
 
     # The slot itself is retained so the send can be retried.
     slots = (
@@ -329,3 +328,90 @@ async def test_one_click_unsubscribe_flag_comes_from_campaign(session, monkeypat
 
     assert captured["list_unsubscribe_one_click"] is False
     assert captured["list_unsubscribe_url"]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_smtp_attempt_is_held_and_pauses_inbox(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inbox = await _make_smtp_inbox(session, email="ambiguous@example.com")
+    slot = await _make_due_slot(session, inbox)
+
+    async def fake_webhook(
+        db: object, event: str, data: dict[str, object]
+    ) -> None:
+        return None
+
+    monkeypatch.setattr("app.jobs.fire_webhook_event", fake_webhook)
+    monkeypatch.setattr(
+        "app.jobs.send_email",
+        lambda **kwargs: SendAmbiguous(
+            message_id=kwargs["smtp_message_id"], message="connection lost after DATA"
+        ),
+    )
+    monkeypatch.setattr(jobs_mod, "AsyncSessionLocal", lambda: _SessionCtx(session))
+
+    await jobs_mod.send_slot_job(slot.id)
+
+    attempt = (
+        await session.execute(select(EmailLog).where(EmailLog.queue_slot_id == slot.id))
+    ).scalar_one()
+    assert attempt.delivery_state == "ambiguous"
+    assert attempt.message_id.startswith("<quickly-")
+    await session.refresh(inbox)
+    assert inbox.paused is True
+    assert (
+        await session.execute(select(func.count(QueueSlot.id)).where(QueueSlot.id == slot.id))
+    ).scalar_one() == 1
+
+
+@pytest.mark.asyncio
+async def test_held_smtp_attempt_reconciles_without_resend(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inbox = await _make_smtp_inbox(session, email="reconcile@example.com")
+    slot = await _make_due_slot(session, inbox)
+    campaign_lead = (
+        await session.execute(
+            select(CampaignLead).where(CampaignLead.id == slot.campaign_lead_id)
+        )
+    ).scalar_one()
+    attempt = EmailLog(
+        queue_slot_id=slot.id,
+        lead_id=campaign_lead.lead_id,
+        campaign_id=campaign_lead.campaign_id,
+        inbox_id=inbox.id,
+        sequence_index=slot.sequence_index,
+        subject="Hello",
+        message_id="<quickly-existing@example.com>",
+        thread_id="<quickly-existing@example.com>",
+        delivery_state="ambiguous",
+    )
+    session.add(attempt)
+    await session.flush()
+
+    sends: list[str] = []
+
+    async def fake_webhook(
+        db: object, event: str, data: dict[str, object]
+    ) -> None:
+        return None
+
+    monkeypatch.setattr("app.jobs.fire_webhook_event", fake_webhook)
+    monkeypatch.setattr("app.jobs.send_email", lambda **kwargs: sends.append("sent"))
+    monkeypatch.setattr(
+        "app.jobs.reconcile_smtp_copy",
+        lambda account, message_id: ReconciliationResult("confirmed"),
+    )
+    monkeypatch.setattr(jobs_mod, "AsyncSessionLocal", lambda: _SessionCtx(session))
+
+    await jobs_mod.send_slot_job(slot.id)
+
+    await session.refresh(attempt)
+    assert attempt.delivery_state == "sent"
+    assert sends == []
+    assert (
+        await session.execute(select(func.count(QueueSlot.id)).where(QueueSlot.id == slot.id))
+    ).scalar_one() == 0

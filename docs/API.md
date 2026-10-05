@@ -601,6 +601,19 @@ Update lead fields. Setting **`enrollment_status`** applies to **all** enrollmen
 
 **Response:** Updated lead object (same shape as `GET`).
 
+#### `POST /api/leads/{id}/suppress`
+
+Stop a lead across every campaign and delete all of that lead's pending queue
+slots.
+
+**Body:** `{ "reason": "unsubscribed" }`
+
+`reason` is one of `unsubscribed`, `hard_bounce`, `manual`, or `complaint`.
+A complaint also pauses every campaign and inbox as a reputation safety stop.
+
+**Response:** suppression status and counts for stopped enrollments, deleted
+slots, paused campaigns, and paused inboxes.
+
 #### `POST /api/leads/{id}/recover`
 
 Update this lead’s **email**, set **`active`**, clear **provider**, then verify-or-recalc (same semantics as one row in **`bulk-recover`**).
@@ -849,7 +862,7 @@ Generic SMTP/IMAP inboxes (Amazon SES or any SMTP relay). Create the inbox first
 
 Create or replace the SMTP/IMAP credentials for an SMTP inbox. On update, an empty password field means "keep the stored secret" (create requires one). Does not test the connection — call the test endpoint explicitly.
 
-**Body:** `smtp_host`, `smtp_port` (default `587`), `smtp_username`, `smtp_password`, `smtp_use_tls` (default `true`), `smtp_use_ssl` (default `false`), plus optional `imap_host`, `imap_port` (default `993`), `imap_username`, `imap_password`, `imap_use_ssl` (default `true`) for inbound reply sync.
+**Body:** `smtp_host`, `smtp_port` (default `587`), `smtp_username`, `smtp_password`, `smtp_use_tls` (default `true`), `smtp_use_ssl` (default `false`), plus optional `imap_host`, `imap_port` (default `993`), `imap_username`, `imap_password`, `imap_use_ssl` (default `true`) for inbound reply sync. Set `reconciliation_copy_enabled: true` for a self-hosted mailbox to add an envelope-only sender copy and reconcile ambiguous SMTP outcomes by exact `Message-ID` without an automatic retry. See [Delivery safety](DELIVERY_SAFETY.md).
 
 > **At rest:** `smtp_password` / `imap_password` are transparently encrypted with `QUICKLY_ENCRYPTION_KEY` (Fernet). Use the UI/API whenever possible. To update them directly in the database (headless setups, credential rotation), generate the ciphertext with `python scripts/encrypt_secret.py --key-from-db --inbox-id <id> --sql` — see [docs/INSTALL.md](INSTALL.md#updating-smtp-credentials-from-the-command-line).
 
@@ -1443,6 +1456,8 @@ List pending queue slots for a campaign.
 ### `GET /api/campaigns/{id}/sent`
 
 Sent email history for a campaign, including variant and interest status per row.
+SMTP rows also expose `delivery_state` (`sending`, `sent`, or `ambiguous`) and
+`delivery_error`; an ambiguous row is held and is not retried automatically.
 
 ### `POST /api/campaigns/{id}/recalculate-queue`
 
